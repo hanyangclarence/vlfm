@@ -64,6 +64,17 @@ class BaseRobot:
         """Opens the gripper"""
         raise NotImplementedError
 
+    def set_base_position(
+        self,
+        x_pos: float,
+        y_pos: float,
+        yaw: float,
+        blocking: bool = False,
+        timeout_sec: float = 10.0,
+    ) -> None:
+        """Drive base to a relative (x, y, yaw) pose. Replaces spot.set_base_position."""
+        raise NotImplementedError
+
     @staticmethod
     def reorient_images(imgs_dict: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """Rotate images if necessary.
