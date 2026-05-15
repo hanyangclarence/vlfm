@@ -152,6 +152,68 @@ class ObstacleMap(BaseMap):
         else:
             self.frontiers = self._px_to_xy(self._frontiers_px)
 
+    def update_from_pointcloud(
+        self,
+        points_episodic: np.ndarray,
+        agent_xy: np.ndarray,
+        agent_heading: float,
+        explore_range_m: float = 8.0,
+    ) -> None:
+        """LiDAR-driven counterpart to update_map: takes an Nx3 cloud already in
+        episodic frame and a 360° free-space reveal centered on the agent.
+        """
+        if points_episodic.size > 0:
+            obstacle_cloud = filter_points_by_height(points_episodic, self._min_height, self._max_height)
+            if obstacle_cloud.shape[0] > 0:
+                xy_points = obstacle_cloud[:, :2]
+                pixel_points = self._xy_to_px(xy_points)
+                self._map[pixel_points[:, 1], pixel_points[:, 0]] = 1
+
+        self._navigable_map = 1 - cv2.dilate(
+            self._map.astype(np.uint8),
+            self._navigable_kernel,
+            iterations=1,
+        ).astype(bool)
+
+        agent_pixel_location = self._xy_to_px(agent_xy.reshape(1, 2))[0]
+        new_explored_area = reveal_fog_of_war(
+            top_down_map=self._navigable_map.astype(np.uint8),
+            current_fog_of_war_mask=np.zeros_like(self._map, dtype=np.uint8),
+            current_point=agent_pixel_location[::-1],
+            current_angle=-agent_heading,
+            fov=360.0,
+            max_line_len=explore_range_m * self.pixels_per_meter,
+        )
+        new_explored_area = cv2.dilate(new_explored_area, np.ones((3, 3), np.uint8), iterations=1)
+        self.explored_area[new_explored_area > 0] = 1
+        self.explored_area[self._navigable_map == 0] = 0
+
+        contours, _ = cv2.findContours(
+            self.explored_area.astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        if len(contours) > 1:
+            min_dist = np.inf
+            best_idx = 0
+            for idx, cnt in enumerate(contours):
+                dist = cv2.pointPolygonTest(cnt, tuple([int(i) for i in agent_pixel_location]), True)
+                if dist >= 0:
+                    best_idx = idx
+                    break
+                elif abs(dist) < min_dist:
+                    min_dist = abs(dist)
+                    best_idx = idx
+            new_area = np.zeros_like(self.explored_area, dtype=np.uint8)
+            cv2.drawContours(new_area, contours, best_idx, 1, -1)  # type: ignore
+            self.explored_area = new_area.astype(bool)
+
+        self._frontiers_px = self._get_frontiers()
+        if len(self._frontiers_px) == 0:
+            self.frontiers = np.array([])
+        else:
+            self.frontiers = self._px_to_xy(self._frontiers_px)
+
     def _get_frontiers(self) -> np.ndarray:
         """Returns the frontiers of the map."""
         # Dilate the explored area slightly to prevent small gaps between the explored

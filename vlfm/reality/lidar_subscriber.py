@@ -62,6 +62,30 @@ def _parse_pointcloud2(msg: "PointCloud2_") -> np.ndarray:
     return xyz[mask]
 
 
+class FakeLidarSubscriber:
+    """Returns a fixed synthetic cloud. Useful for FakeGo2Robot end-to-end tests."""
+
+    def __init__(self, points_lidar_frame: Optional[np.ndarray] = None) -> None:
+        if points_lidar_frame is None:
+            points_lidar_frame = _default_box_cloud()
+        self._points = points_lidar_frame.astype(np.float32)
+
+    def get_latest(self) -> Optional[np.ndarray]:
+        return self._points.copy()
+
+
+def _default_box_cloud() -> np.ndarray:
+    """A square room (5m x 5m) with walls at ±2.5m, sampled densely."""
+    rng = np.linspace(-2.5, 2.5, 200, dtype=np.float32)
+    z = np.full_like(rng, 0.8)
+    walls = []
+    for x_fixed in (-2.5, 2.5):
+        walls.append(np.stack([np.full_like(rng, x_fixed), rng, z], axis=1))
+    for y_fixed in (-2.5, 2.5):
+        walls.append(np.stack([rng, np.full_like(rng, y_fixed), z], axis=1))
+    return np.concatenate(walls, axis=0)
+
+
 def transform_cloud(xyz_local: np.ndarray, tf_local_to_global: np.ndarray) -> np.ndarray:
     """Apply a 4x4 SE(3) to an Nx3 cloud."""
     if xyz_local.size == 0:

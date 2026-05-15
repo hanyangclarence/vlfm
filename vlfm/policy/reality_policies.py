@@ -111,31 +111,39 @@ class RealityMixin:
             return
 
         self._obstacle_map: ObstacleMap
-        for obs_map_data in observations["obstacle_map_depths"][:-1]:
-            depth, tf, min_depth, max_depth, fx, fy, topdown_fov = obs_map_data
+        lidar_cloud = observations.get("lidar_cloud", None)
+        if lidar_cloud is not None:
+            self._obstacle_map.update_from_pointcloud(
+                points_episodic=lidar_cloud,
+                agent_xy=observations["robot_xy"],
+                agent_heading=observations["robot_heading"],
+            )
+        else:
+            for obs_map_data in observations["obstacle_map_depths"][:-1]:
+                depth, tf, min_depth, max_depth, fx, fy, topdown_fov = obs_map_data
+                self._obstacle_map.update_map(
+                    depth,
+                    tf,
+                    min_depth,
+                    max_depth,
+                    fx,
+                    fy,
+                    topdown_fov,
+                    explore=False,
+                )
+
+            _, tf, min_depth, max_depth, fx, fy, topdown_fov = observations["obstacle_map_depths"][-1]
             self._obstacle_map.update_map(
-                depth,
+                None,
                 tf,
                 min_depth,
                 max_depth,
                 fx,
                 fy,
                 topdown_fov,
-                explore=False,
+                explore=True,
+                update_obstacles=False,
             )
-
-        _, tf, min_depth, max_depth, fx, fy, topdown_fov = observations["obstacle_map_depths"][-1]
-        self._obstacle_map.update_map(
-            None,
-            tf,
-            min_depth,
-            max_depth,
-            fx,
-            fy,
-            topdown_fov,
-            explore=True,
-            update_obstacles=False,
-        )
 
         self._obstacle_map.update_agent_traj(observations["robot_xy"], observations["robot_heading"])
         frontiers = self._obstacle_map.frontiers
