@@ -30,16 +30,30 @@ FRONT_CAMERA_PINHOLE_CX: float = 320.0  # TODO(B)
 FRONT_CAMERA_PINHOLE_CY: float = 240.0  # TODO(B)
 
 # --- Static transforms -------------------------------------------------------
-# All transforms are 4x4 SE(3), child_T_parent semantics: tf @ point_in_parent.
+# All transforms are 4x4 SE(3) in the form parent_T_child: a point expressed in
+# the child frame is mapped into the parent frame by `parent_T_child @ p_child`.
+# Body frame: x-forward, y-left, z-up (Unitree convention).
+# Translation in meters, rotation as a 3x3 in the upper-left block.
 
 def _identity() -> np.ndarray:
     return np.eye(4, dtype=np.float64)
 
-# body -> front_camera. TODO(A): pull from Unitree URDF.
-TF_BODY_TO_FRONT_CAMERA: np.ndarray = _identity()
 
-# body -> utlidar. TODO(A): pull from Unitree URDF.
-TF_BODY_TO_UTLIDAR: np.ndarray = _identity()
+def _translation(x: float, y: float, z: float) -> np.ndarray:
+    tf = np.eye(4, dtype=np.float64)
+    tf[:3, 3] = [x, y, z]
+    return tf
+
+
+# body_T_front_camera. Approximate values from published Go2 spec:
+# front fisheye sits in the head, ~32 cm forward of body origin and ~4 cm up.
+# TODO(A): replace with exact values from the Go2 URDF on hardware bring-up.
+TF_BODY_TO_FRONT_CAMERA: np.ndarray = _translation(0.32, 0.0, 0.04)
+
+# body_T_utlidar. The L1 LiDAR sits on top of the body, slightly forward of
+# the geometric center.
+# TODO(A): replace with exact values from the Go2 URDF on hardware bring-up.
+TF_BODY_TO_UTLIDAR: np.ndarray = _translation(0.06, 0.0, 0.18)
 
 # Camera-convention to xyz-convention rotation, copied from Spot
 # (objectnav_env.py:141). Verify sign convention for Go2's front camera.

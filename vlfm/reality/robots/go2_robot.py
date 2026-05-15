@@ -1,4 +1,9 @@
 # Owned by Person A. Wraps unitree_sdk2py for the VLFM BaseRobot interface.
+#
+# Pose interface: `xy_yaw` and `get_transform(frame)` live directly on this class
+# (matching `BDSWRobot`). We deliberately do not introduce a separate `Go2Pose`
+# dataclass — the env code reads pose through `BaseRobot`, and adding a wrapper
+# would force every callsite to special-case Go2.
 
 import threading
 import time
@@ -24,16 +29,28 @@ try:
 except ImportError:
     _HAS_SDK = False
 
+try:
+    from unitree_sdk2py.go2.motion_switcher.motion_switcher_client import MotionSwitcherClient
 
-SPORT_STATE_TOPIC = "rt/lf/sportmodestate"  # TODO(A): verify against firmware version
+    _HAS_MOTION_SWITCHER = True
+except ImportError:
+    _HAS_MOTION_SWITCHER = False
+
+
+# Firmware versions before ~1.0.21 publish on `rt/sportmodestate`; later versions
+# use `rt/lf/sportmodestate`. We try the modern topic first and fall back.
+SPORT_STATE_TOPICS = ("rt/lf/sportmodestate", "rt/sportmodestate")
 
 # P-controller gains for set_base_position. TODO(A): tune on hardware.
-KP_LIN = 0.8
+KP_LIN = 0.9
 KP_ANG = 1.2
 MAX_LIN_VEL = 0.5
 MAX_ANG_VEL = 1.0
-POS_TOL = 0.10  # meters
-YAW_TOL = np.deg2rad(5.0)
+POS_TOL = 0.05  # meters
+YAW_TOL = np.deg2rad(2.0)
+# Within DECEL_RADIUS meters of goal, linear velocity is scaled by err / DECEL_RADIUS
+# so the dog eases in instead of hard-stopping at tolerance and oscillating.
+DECEL_RADIUS = 0.30
 
 
 class Go2Robot(BaseRobot):
@@ -45,6 +62,8 @@ class Go2Robot(BaseRobot):
 
         ChannelFactoryInitialize(0, network_interface)
 
+        self._ensure_sport_mode()
+
         self._sport = SportClient()
         self._sport.SetTimeout(10.0)
         self._sport.Init()
@@ -55,10 +74,50 @@ class Go2Robot(BaseRobot):
 
         self._state_lock = threading.Lock()
         self._latest_state: Optional[SportModeState_] = None
-        self._state_sub = ChannelSubscriber(SPORT_STATE_TOPIC, SportModeState_)
-        self._state_sub.Init(self._on_sport_state, 10)
+        self._state_sub = self._subscribe_sport_state()
 
         self._wait_for_first_state(timeout_sec=5.0)
+
+        # Worker for non-blocking set_base_position (lazily created).
+        self._goto_thread: Optional[threading.Thread] = None
+        self._goto_cancel: threading.Event = threading.Event()
+
+    def _ensure_sport_mode(self) -> None:
+        """Switch the robot into 'normal' (Sport) mode so SportClient commands apply.
+
+        Firmwares ship with multiple motion modes (e.g. AI mode). SportClient is a
+        no-op outside Sport mode, which silently looks like a dead robot.
+        """
+        if not _HAS_MOTION_SWITCHER:
+            return
+        try:
+            switcher = MotionSwitcherClient()
+            switcher.SetTimeout(5.0)
+            switcher.Init()
+            status, result = switcher.CheckMode()
+            mode = result.get("name") if isinstance(result, dict) else None
+            if status == 0 and mode != "normal":
+                switcher.ReleaseMode()
+                time.sleep(1.0)
+                switcher.SelectMode("normal")
+                time.sleep(2.0)
+        except Exception:
+            # Don't gate startup on the switcher — log-and-continue. Operator
+            # can fall back to manually selecting Sport mode on the controller.
+            pass
+
+    def _subscribe_sport_state(self) -> "ChannelSubscriber":
+        """Subscribe to whichever SportModeState topic this firmware publishes."""
+        last_err: Optional[Exception] = None
+        for topic in SPORT_STATE_TOPICS:
+            try:
+                sub = ChannelSubscriber(topic, SportModeState_)
+                sub.Init(self._on_sport_state, 10)
+                return sub
+            except Exception as e:  # topic may not exist on this firmware
+                last_err = e
+                continue
+        raise RuntimeError(f"Could not subscribe to any of {SPORT_STATE_TOPICS}: {last_err}")
 
     # ----- Lifecycle ---------------------------------------------------------
 
@@ -86,7 +145,7 @@ class Go2Robot(BaseRobot):
                 if self._latest_state is not None:
                     return
             time.sleep(0.05)
-        raise RuntimeError(f"Timed out waiting for {SPORT_STATE_TOPIC}")
+        raise RuntimeError(f"Timed out waiting for SportModeState_ on any of {SPORT_STATE_TOPICS}")
 
     def _state(self) -> "SportModeState_":
         with self._state_lock:
@@ -140,38 +199,71 @@ class Go2Robot(BaseRobot):
         blocking: bool = True,
         timeout_sec: float = 10.0,
     ) -> None:
-        # Treat (x_pos, y_pos, yaw) as relative to the current pose (matches the
-        # `relative=True` semantics in pointnav_env.py:88).
+        """Drive to a body-relative pose using a P-controller with deceleration ramp.
+
+        (x_pos, y_pos, yaw) are interpreted in the current body frame and converted
+        to a global target. Matches `relative=True` semantics in pointnav_env.py:88.
+        """
         start_xy, start_yaw = self.xy_yaw
         cos_y, sin_y = np.cos(start_yaw), np.sin(start_yaw)
         target_xy = start_xy + np.array([cos_y * x_pos - sin_y * y_pos, sin_y * x_pos + cos_y * y_pos])
         target_yaw = _wrap(start_yaw + yaw)
 
-        if not blocking:
-            # TODO(A): non-blocking variant — spawn a worker thread that holds
-            # the controller until convergence. For now require blocking=True.
-            raise NotImplementedError("Non-blocking set_base_position is a TODO")
+        # Preempt any previous non-blocking goto.
+        self.cancel_base_position()
 
+        if blocking:
+            self._run_goto_loop(target_xy, target_yaw, timeout_sec, self._goto_cancel)
+            return
+
+        self._goto_cancel = threading.Event()
+        cancel = self._goto_cancel
+        self._goto_thread = threading.Thread(
+            target=self._run_goto_loop,
+            args=(target_xy, target_yaw, timeout_sec, cancel),
+            daemon=True,
+        )
+        self._goto_thread.start()
+
+    def cancel_base_position(self) -> None:
+        """Preempt the non-blocking goto worker (if one is running)."""
+        if self._goto_thread is not None and self._goto_thread.is_alive():
+            self._goto_cancel.set()
+            self._goto_thread.join(timeout=1.0)
+        self._goto_thread = None
+
+    def _run_goto_loop(
+        self,
+        target_xy: np.ndarray,
+        target_yaw: float,
+        timeout_sec: float,
+        cancel: threading.Event,
+    ) -> None:
         deadline = time.time() + timeout_sec
-        while time.time() < deadline:
+        while time.time() < deadline and not cancel.is_set():
             xy, current_yaw = self.xy_yaw
             err = target_xy - xy
-            if np.linalg.norm(err) < POS_TOL and abs(_wrap(target_yaw - current_yaw)) < YAW_TOL:
+            err_norm = float(np.linalg.norm(err))
+            yaw_err = _wrap(target_yaw - current_yaw)
+
+            if err_norm < POS_TOL and abs(yaw_err) < YAW_TOL:
                 self._sport.StopMove()
                 return
 
-            # Body-frame error
             cy, sy = np.cos(current_yaw), np.sin(current_yaw)
             err_body = np.array([cy * err[0] + sy * err[1], -sy * err[0] + cy * err[1]])
-            yaw_err = _wrap(target_yaw - current_yaw)
 
-            vx = float(np.clip(KP_LIN * err_body[0], -MAX_LIN_VEL, MAX_LIN_VEL))
-            vy = float(np.clip(KP_LIN * err_body[1], -MAX_LIN_VEL, MAX_LIN_VEL))
+            # Deceleration ramp: inside DECEL_RADIUS, scale velocity by err/RADIUS.
+            scale = min(1.0, err_norm / DECEL_RADIUS) if err_norm > 0 else 0.0
+            vx = float(np.clip(KP_LIN * err_body[0], -MAX_LIN_VEL, MAX_LIN_VEL)) * scale
+            vy = float(np.clip(KP_LIN * err_body[1], -MAX_LIN_VEL, MAX_LIN_VEL)) * scale
             vyaw = float(np.clip(KP_ANG * yaw_err, -MAX_ANG_VEL, MAX_ANG_VEL))
             self._sport.Move(vx, vy, vyaw)
             time.sleep(0.05)
 
         self._sport.StopMove()
+        if cancel.is_set():
+            return
         raise TimeoutError(f"set_base_position did not converge in {timeout_sec}s")
 
     # ----- Arm / gripper (no-ops for Go2) -----------------------------------
@@ -236,6 +328,9 @@ class FakeGo2Robot(BaseRobot):
         cy, sy = np.cos(self._yaw), np.sin(self._yaw)
         self._xy += np.array([cy * x_pos - sy * y_pos, sy * x_pos + cy * y_pos])
         self._yaw = _wrap(self._yaw + yaw)
+
+    def cancel_base_position(self) -> None:
+        return
 
     def set_arm_joints(self, joints: np.ndarray, travel_time: float) -> None:
         return
